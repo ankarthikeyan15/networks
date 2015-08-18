@@ -1,48 +1,141 @@
-#define      _GNU_SOURCE
-#include <stdio.h>
-#include <arpa/inet.h>
-#include <string.h>
-#include <stdlib.h>
 
-int ping(char *ipaddr) {
-  char *command = NULL;
-  FILE *fp;
-  int stat = 0;
-  asprintf (&command, "%s %s -q 2>&1", "fping", ipaddr);
-  fp = popen(command, "r");
-  if (fp == NULL) {
-    fprintf(stderr, "Failed to execute fping command\n");
-    free(command);
-    return -1;
-  }
-  stat = pclose(fp);
-  free(command);
-  return WEXITSTATUS(stat);
-}
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <resolv.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/ip_icmp.h>
 
-/*  Check if an ip address is valid */
-int isValidIpAddress(char *ipaddr)
+#define PACKETSIZE	64
+struct packet
 {
-    struct sockaddr_in sa;
-    int result = inet_pton(AF_INET, ipaddr, &(sa.sin_addr));
-    return result != 0;
+	struct icmphdr hdr;
+	char msg[PACKETSIZE-sizeof(struct icmphdr)];
+};
+
+int pid=-1;
+struct protoent *proto=NULL;
+unsigned short checksum(void *b, int len)
+{	unsigned short *buf = b;
+	unsigned int sum=0;
+	unsigned short result;
+
+	for ( sum = 0; len > 1; len -= 2 )
+		sum += *buf++;
+	if ( len == 1 )
+		sum += *(unsigned char*)buf;
+	sum = (sum >> 16) + (sum & 0xFFFF);
+	sum += (sum >> 16);
+	result = ~sum;
+	return result;
 }
+void display(void *buf, int bytes)
+{	int i;
+	struct iphdr *ip = buf;
+	struct icmphdr *icmp = buf+ip->ihl*4;
 
+	printf("----------------\n");
+	for ( i = 0; i < bytes; i++ )
+	{
+		if ( !(i & 15) ) printf("\n%X:  ", i);
+		printf("%X ", ((unsigned char*)buf)[i]);
+	}
+	printf("\n");
+	printf("IPv%d: hdr-size=%d pkt-size=%d protocol=%d TTL=%d src=%d ",
+		ip->version, ip->ihl*4, ntohs(ip->tot_len), ip->protocol,
+		ip->ttl, inet_ntoa(ip->saddr));
+	printf("dst=%d\n", inet_ntoa(ip->daddr));
+	if ( icmp->un.echo.id == pid )
+	{
+		printf("ICMP: type[%d/%d] checksum[%d] id[%d] seq[%d]\n",
+			icmp->type, icmp->code, ntohs(icmp->checksum),
+			icmp->un.echo.id, icmp->un.echo.sequence);
+	}
+}
+void listener(void)
+{	int sd;
+	struct sockaddr_in addr;
+	unsigned char buf[1024];
 
-int main(int argc, char **argv) {
-  int status = 0;
-  if(argc != 2) {
-    printf("Example Usage: %s 192.168.1.1\n", argv[0]);
-    return 1;
-  } else if(!isValidIpAddress(argv[1])) {
-    printf("%s is an invalid IP Address\n", argv[1]);
-    return 1;
-  }
-  status = ping(argv[1]);
-  if (status) {
-    printf("Could ping %s successfully, status %d\n", argv[1], status);
-  } else {
-    printf("Machine not reachable, status %d\n", status);
-  }
-  return status;
+	sd = socket(PF_INET, SOCK_RAW, proto->p_proto);
+	if ( sd < 0 )
+	{
+		perror("socket");
+		exit(0);
+	}
+	for (;;)
+	{	int bytes, len=sizeof(addr);
+
+		bzero(buf, sizeof(buf));
+		bytes = recvfrom(sd, buf, sizeof(buf), 0, (struct sockaddr*)&addr, &len);
+		if ( bytes > 0 )
+			display(buf, bytes);
+		else
+			perror("recvfrom");
+	}
+	exit(0);
+}
+void ping(struct sockaddr_in *addr)
+{	const int val=255;
+	int i, sd, cnt=1;
+	struct packet pckt;
+	struct sockaddr_in r_addr;
+
+	sd = socket(PF_INET, SOCK_RAW, proto->p_proto);
+	if ( sd < 0 )
+	{
+		perror("socket");
+		return;
+	}
+	if ( setsockopt(sd, SOL_IP, IP_TTL, &val, sizeof(val)) != 0)
+		perror("Set TTL option");
+	if ( fcntl(sd, F_SETFL, O_NONBLOCK) != 0 )
+		perror("Request nonblocking I/O");
+	for (;;)
+	{	int len=sizeof(r_addr);
+
+		printf("Msg #%d\n", cnt);
+		if ( recvfrom(sd, &pckt, sizeof(pckt), 0, (struct sockaddr*)&r_addr, &len) > 0 )
+			printf("***Got message!***\n");
+		bzero(&pckt, sizeof(pckt));
+		pckt.hdr.type = ICMP_ECHO;
+		pckt.hdr.un.echo.id = pid;
+		for ( i = 0; i < sizeof(pckt.msg)-1; i++ )
+			pckt.msg[i] = i+'0';
+		pckt.msg[i] = 0;
+		pckt.hdr.un.echo.sequence = cnt++;
+		pckt.hdr.checksum = checksum(&pckt, sizeof(pckt));
+		if ( sendto(sd, &pckt, sizeof(pckt), 0, (struct sockaddr*)addr, sizeof(*addr)) <= 0 )
+			perror("sendto");
+		sleep(1);
+	}
+}
+int main(int count, char *strings[])
+{	struct hostent *hname;
+	struct sockaddr_in addr;
+
+	if ( count != 2 )
+	{
+		printf("usage: %s <addr>\n", strings[0]);
+		exit(0);
+	}
+	if ( count > 1 )
+	{
+		pid = getpid();
+		proto = getprotobyname("ICMP");
+		hname = gethostbyname(strings[1]);
+		bzero(&addr, sizeof(addr));
+		addr.sin_family = hname->h_addrtype;
+		addr.sin_port = 0;
+		addr.sin_addr.s_addr = *(long*)hname->h_addr;
+		if ( fork() == 0 )
+			listener();
+		else
+			ping(&addr);
+		wait(0);
+	}
+	else
+		printf("usage: myping <hostname>\n");
+	return 0;
 }
