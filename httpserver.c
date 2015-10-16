@@ -23,7 +23,7 @@ int main(int argc, char **argv) {
  time (&timenow);  
  timeinfo = localtime(&timenow);  
   
- char * header, * request, * path, * newpath, * host;  
+ char * header, * request, * path, * newpath, * host; 
  char * dir, * temp;  
  int port, sockfd, connfd;  
  char get[3], http[9];  
